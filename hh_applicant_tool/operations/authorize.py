@@ -7,6 +7,9 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
+import time
+import json
+import sys
 
 from playwright.async_api import async_playwright
 
@@ -185,7 +188,19 @@ class Operation(BaseOperation):
                 )
                 api_client.handle_access_token(token)
 
-                print("🔓 Авторизация прошла успешно!")
+                access_expires_at = int(time.time()) + int(token["access_expires_at"])
+
+                auth_data = {
+                    "token": {
+                        "access_expires_at": access_expires_at,
+                        "access_token": token["access_token"],
+                        "refresh_token": token["refresh_token"],
+                    }
+                }
+
+                print("🔓 Авторизация прошла успешно!", file=sys.stderr)
+
+                print(json.dumps(auth_data, ensure_ascii=False))
 
             finally:
                 logger.debug("Закрытие браузера")
