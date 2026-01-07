@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 from typing import TYPE_CHECKING
+import json
 
 from ..main import BaseOperation
 from ..main import Namespace as BaseNamespace
@@ -46,9 +47,11 @@ class Operation(BaseOperation):
             )
         )
         counters = result["counters"]
-        print(
-            f"🆔 {result['id']} {full_name or 'Анонимный аккаунт'} "
-            f"[ 📄 {counters['resumes_count']} "
-            f"| 👁️  {fmt_plus(counters['new_resume_views'])} "
-            f"| ✉️  {fmt_plus(counters['unread_negotiations'])} ]"
-        )
+
+        # Формируем словарь
+        data = {
+            "id": result["id"],
+            "name": full_name or "Анонимный аккаунт"
+        }
+
+        print(json.dumps(data, ensure_ascii=False))
