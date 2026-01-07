@@ -188,11 +188,9 @@ class Operation(BaseOperation):
                 )
                 api_client.handle_access_token(token)
 
-                access_expires_at = int(time.time()) + int(token["access_expires_at"])
-
                 auth_data = {
                     "token": {
-                        "access_expires_at": access_expires_at,
+                        "access_expires_at": int(time.time()) + int(token["access_expires_at"]),
                         "access_token": token["access_token"],
                         "refresh_token": token["refresh_token"],
                     }
