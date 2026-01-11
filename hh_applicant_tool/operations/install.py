@@ -6,8 +6,7 @@ import sys
 from runpy import run_module
 from typing import TYPE_CHECKING
 
-from ..main import BaseOperation
-from ..main import Namespace as BaseNamespace
+from ..main import BaseNamespace, BaseOperation
 
 if TYPE_CHECKING:
     from ..main import HHApplicantTool
@@ -27,5 +26,9 @@ class Operation(BaseOperation):
         pass
 
     def run(self, applicant_tool: HHApplicantTool) -> None:
+        orig_argv = sys.argv
         sys.argv = ["playwright", "install", "chromium"]
-        run_module("playwright", run_name="__main__")
+        try:
+            run_module("playwright", run_name="__main__")
+        finally:
+            sys.argv = orig_argv

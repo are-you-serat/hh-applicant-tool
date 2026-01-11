@@ -6,10 +6,10 @@ import logging
 from typing import TYPE_CHECKING
 
 from ..api import ApiError
-from ..main import BaseOperation
-from ..main import Namespace as BaseNamespace
-from ..types import Paginated
-from ..utils import print_err, shorten
+from ..datatypes import PaginatedItems
+from ..main import BaseNamespace, BaseOperation
+from ..utils import print_err
+from ..utils.string import shorten
 
 if TYPE_CHECKING:
     from ..main import HHApplicantTool
@@ -31,7 +31,7 @@ class Operation(BaseOperation):
         pass
 
     def run(self, applicant_tool: HHApplicantTool) -> None:
-        resumes: Paginated = applicant_tool.get_resumes()
+        resumes: PaginatedItems = applicant_tool.get_resumes()
         for resume in resumes["items"]:
             try:
                 res = applicant_tool.api_client.post(

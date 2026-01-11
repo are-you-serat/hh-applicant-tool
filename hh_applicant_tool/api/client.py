@@ -7,22 +7,24 @@ import time
 from dataclasses import dataclass
 from functools import cached_property
 from threading import Lock
-from typing import Any, Literal
-from urllib.parse import urlencode
+from typing import Any, Literal, TypeVar
+from urllib.parse import urlencode, urljoin
 
 import requests
 from requests import Session
 
-from ..types import AccessToken
+from ..datatypes import AccessToken
 from . import errors
 
 __all__ = ("ApiClient", "OAuthClient")
 
-logger = logging.getLogger(__package__)
-
-
-ALLOWED_METHODS = Literal["GET", "POST", "PUT", "DELETE"]
 DEFAULT_DELAY = 0.334
+
+AllowedMethods = Literal["GET", "POST", "PUT", "DELETE"]
+T = TypeVar("T")
+
+
+logger = logging.getLogger(__package__)
 
 
 # Thread-safe
@@ -36,6 +38,7 @@ class BaseClient:
     _previous_request_time: float = 0.0
 
     def __post_init__(self) -> None:
+        assert self.base_url.endswith("/"), "base_url must end with /"
         self.lock = Lock()
         # logger.debug(f"user agent: {self.user_agent}")
         if not self.session:
@@ -50,20 +53,21 @@ class BaseClient:
 
     def default_headers(self) -> dict[str, str]:
         return {
-            "user-agent": self.user_agent or "Mozilla/5.0",
+            "user-agent": self.user_agent
+            or "Mozilla/5.0 (+https://github.com/s3rgeym/hh-applicant-tool)",
             "x-hh-app-active": "true",
         }
 
     def request(
         self,
-        method: ALLOWED_METHODS,
+        method: AllowedMethods,
         endpoint: str,
         params: dict[str, Any] | None = None,
         delay: float | None = None,
         **kwargs: Any,
-    ) -> dict:
+    ) -> T:
         # Не знаю насколько это "правильно"
-        assert method in ALLOWED_METHODS.__args__
+        assert method in AllowedMethods.__args__
         params = dict(params or {})
         params.update(kwargs)
         url = self.resolve_url(endpoint)
@@ -117,20 +121,20 @@ class BaseClient:
         )
         return rv
 
-    def get(self, *args, **kwargs):
+    def get(self, *args, **kwargs) -> T:
         return self.request("GET", *args, **kwargs)
 
-    def post(self, *args, **kwargs):
+    def post(self, *args, **kwargs) -> T:
         return self.request("POST", *args, **kwargs)
 
-    def put(self, *args, **kwargs):
+    def put(self, *args, **kwargs) -> T:
         return self.request("PUT", *args, **kwargs)
 
-    def delete(self, *args, **kwargs):
+    def delete(self, *args, **kwargs) -> T:
         return self.request("DELETE", *args, **kwargs)
 
     def resolve_url(self, url: str) -> str:
-        return url if "://" in url else f"{self.base_url.rstrip('/')}/{url.lstrip('/')}"
+        return urljoin(self.base_url, url.lstrip("/"))
 
 
 @dataclass
@@ -138,7 +142,7 @@ class OAuthClient(BaseClient):
     client_id: str
     client_secret: str
     _: dataclasses.KW_ONLY
-    base_url: str = "https://hh.ru/oauth"
+    base_url: str = "https://hh.ru/oauth/"
     state: str = ""
     scope: str = ""
     redirect_uri: str = ""
@@ -221,14 +225,16 @@ class ApiClient(BaseClient):
     # Реализовано автоматическое обновление токена
     def request(
         self,
-        method: ALLOWED_METHODS,
+        method: AllowedMethods,
         endpoint: str,
         params: dict[str, Any] | None = None,
         delay: float | None = None,
         **kwargs: Any,
-    ) -> dict:
+    ) -> T:
         def do_request():
-            return BaseClient.request(self, method, endpoint, params, delay, **kwargs)
+            return BaseClient.request(
+                self, method, endpoint, params, delay, **kwargs
+            )
 
         try:
             return do_request()

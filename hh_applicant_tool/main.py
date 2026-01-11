@@ -2,39 +2,35 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
 import sys
+from collections.abc import Sequence
 from functools import cached_property
 from importlib import import_module
 from itertools import count
-from logging.handlers import RotatingFileHandler
 from os import getenv
 from pathlib import Path
 from pkgutil import iter_modules
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 import requests
 import urllib3
 
+from . import datatypes, utils
 from .api import ApiClient
 from .constants import ANDROID_CLIENT_ID, ANDROID_CLIENT_SECRET
-from .log import ColorHandler, RedactingFilter
 from .storage import StorageFacade
-from .storage.schema import create_schema
-from .utils import (
-    Config,
-    android_user_agent,
-    fix_windows_color_output,
-    get_config_path,
-)
+from .utils.log import setup_logger
+from .utils.mixins import MegaTool
 
-DEFAULT_CONFIG_DIR = get_config_path() / (__package__ or "").replace("_", "-")
+DEFAULT_CONFIG_DIR = utils.get_config_path() / (__package__ or "").replace(
+    "_", "-"
+)
 DEFAULT_CONFIG_FILENAME = "config.json"
 DEFAULT_LOG_FILENAME = "log.txt"
 DEFAULT_DATABASE_FILENAME = "data"
 DEFAULT_PROFILE_ID = "."
-
-MAX_LOG_SIZE = 5 * 1 << 20
 
 logger = logging.getLogger(__package__)
 
@@ -44,7 +40,7 @@ class BaseOperation:
 
     def run(
         self,
-        applicant_tool: HHApplicantTool,
+        tool: HHApplicantTool,
     ) -> None | int:
         raise NotImplementedError()
 
@@ -52,7 +48,7 @@ class BaseOperation:
 OPERATIONS = "operations"
 
 
-class Namespace(argparse.Namespace):
+class BaseNamespace(argparse.Namespace):
     profile_id: str
     config_dir: Path
     verbosity: int
@@ -62,12 +58,12 @@ class Namespace(argparse.Namespace):
     disable_telemetry: bool
 
 
-class HHApplicantTool:
+class HHApplicantTool(MegaTool):
     """Утилита для автоматизации действий соискателя на сайте hh.ru.
 
     Исходники и предложения: <https://github.com/s3rgeym/hh-applicant-tool>
 
-    Группа поддержки: <https://t.me/applicant_tool>
+    Группа поддержки: <https://t.me/hh_applicant_tool>
     """
 
     class ArgumentFormatter(
@@ -120,25 +116,14 @@ class HHApplicantTool:
         subparsers = parser.add_subparsers(help="commands")
         package_dir = Path(__file__).resolve().parent / OPERATIONS
         for _, module_name, _ in iter_modules([str(package_dir)]):
+            if module_name.startswith("_"):
+                continue
             mod = import_module(f"{__package__}.{OPERATIONS}.{module_name}")
             op: BaseOperation = mod.Operation()
-            words = module_name.split("_")
-
-            kebab_name = "-".join(words)
-            aliases = set()
-            aliases.update(getattr(op, "__aliases__", []))
-
-            if kebab_name != module_name:
-                # camelCase
-                aliases.add(words[0] + "".join(word.title() for word in words[1:]))
-
-                # flatcase
-                aliases.add("".join(words))
-
+            kebab_name = module_name.replace("_", "-")
             op_parser = subparsers.add_parser(
                 kebab_name,
-                # Добавляем остальные варианты в псевдонимы
-                aliases=aliases,
+                aliases=getattr(op, "__aliases__", []),
                 description=op.__doc__,
                 formatter_class=self.ArgumentFormatter,
             )
@@ -146,6 +131,15 @@ class HHApplicantTool:
             op.setup_parser(op_parser)
         parser.set_defaults(run=None)
         return parser
+
+    def __init__(self, argv: Sequence[str] | None):
+        self._parse_args(argv)
+
+        # Создаем путь до конфига
+        self.config_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
     def _get_proxies(self) -> dict[str, str]:
         proxy_url = self.args.proxy_url or self.config.get("proxy_url")
@@ -185,8 +179,8 @@ class HHApplicantTool:
         return (self.args.config_dir / self.args.profile_id).resolve()
 
     @cached_property
-    def config(self) -> Config:
-        return Config(self.config_path / DEFAULT_CONFIG_FILENAME)
+    def config(self) -> utils.Config:
+        return utils.Config(self.config_path / DEFAULT_CONFIG_FILENAME)
 
     @cached_property
     def log_file(self) -> Path:
@@ -198,8 +192,7 @@ class HHApplicantTool:
 
     @cached_property
     def db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, autocommit=True)
-        create_schema(conn)
+        conn = sqlite3.connect(self.db_path)
         return conn
 
     @cached_property
@@ -218,15 +211,15 @@ class HHApplicantTool:
             refresh_token=token.get("refresh_token"),
             access_expires_at=token.get("access_expires_at"),
             delay=args.delay,
-            user_agent=config["user_agent"] or android_user_agent(),
+            user_agent=config["user_agent"] or utils.hh_android_useragent(),
             session=self.session,
         )
         return api
 
-    def get_me(self) -> dict:
-        return self.api_client.get("me")
+    def get_me(self) -> datatypes.User:
+        return self.api_client.get("/me")
 
-    def get_resumes(self) -> dict:
+    def get_resumes(self) -> datatypes.PaginatedItems[datatypes.Resume]:
         return self.api_client.get("/resumes/mine")
 
     def first_resume_id(self):
@@ -237,13 +230,17 @@ class HHApplicantTool:
     def get_blacklisted(self) -> list[str]:
         rv = []
         for page in count():
-            r = self.api_client.get("/employers/blacklisted", page=page)
+            r: datatypes.PaginatedItems[datatypes.EmployerShort] = (
+                self.api_client.get("/employers/blacklisted", page=page)
+            )
             rv += [item["id"] for item in r["items"]]
             if page + 1 >= r["pages"]:
                 break
         return rv
 
-    def get_negotiations(self, status: str = "active") -> Iterable[dict]:
+    def get_negotiations(
+        self, status: str = "active"
+    ) -> Iterable[datatypes.Negotiation]:
         for page in count():
             r: dict[str, Any] = self.api_client.get(
                 "/negotiations",
@@ -262,85 +259,60 @@ class HHApplicantTool:
             if page + 1 >= r.get("pages", 0):
                 break
 
-    def _setup_logger(self) -> None:
-        args = self.args
+    def save_token(self) -> bool:
+        if self.api_client.access_token != self.config.get("token", {}).get(
+            "access_token"
+        ):
+            self.config.save(token=self.api_client.get_access_token())
+            return True
+        return False
 
-        # В лог-файл пишем все!
-        logger.setLevel(logging.DEBUG)
-
-        # В консоль стараемся не мусорить
-        log_level = max(logging.DEBUG, logging.WARNING - args.verbosity * 10)
-        color_handler = ColorHandler()
-        # [C] Critical Error Occurred
-        color_handler.setFormatter(logging.Formatter("[%(levelname).1s] %(message)s"))
-        color_handler.setLevel(log_level)
-
-        # Логи
-        file_handler = RotatingFileHandler(
-            self.log_file,
-            maxBytes=MAX_LOG_SIZE,
-            # backupCount=1,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        )
-        file_handler.setLevel(logging.DEBUG)
-
-        redactor = RedactingFilter(
-            [
-                r"\bUSER[A-Z0-9]{60}\b",
-                r"\b[a-fA-F0-9]{32}\b",  # request_id, возвращаемый сервером содержит хеш от айпи  # noqa: E501
-                ANDROID_CLIENT_SECRET,
-            ]
+    def run(self) -> None | int:
+        verbosity_level = max(
+            logging.DEBUG,
+            logging.WARNING - self.args.verbosity * 10,
         )
 
-        for h in [color_handler, file_handler]:
-            h.addFilter(redactor)
-            logger.addHandler(h)
-
-    def run(self, argv: Sequence[str] | None) -> None | int:
-        parser = self._create_parser()
-        self.args = parser.parse_args(argv, namespace=Namespace())
+        setup_logger(logger, verbosity_level, self.log_file)
 
         if sys.platform == "win32":
-            fix_windows_color_output()
+            utils.setup_terminal()
 
-        # Создаем путь до конфига
-        self.config_path.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        try:
+            if self.args.run:
+                try:
+                    res = self.args.run(self)
+                    if self.save_token():
+                        logger.info("Токен был обновлен.")
+                    return res
+                except KeyboardInterrupt:
+                    logger.warning("Выполнение прервано пользователем!")
+                    return 1
+                except sqlite3.Error as ex:
+                    logger.exception(ex)
 
-        self._setup_logger()
+                    script_name = sys.argv[0].split(os.sep)[-1]
 
-        if self.args.run:
+                    logger.warning(
+                        f"Возможно база данных повреждена, попробуйте выполнить команду:\n\n"  # noqa: E501
+                        f"  {script_name} migrate-db"
+                    )
+                    return 1
+                except Exception as e:
+                    logger.exception(e)
+                    return 1
+            self._parser.print_help(file=sys.stderr)
+            return 2
+        finally:
             try:
-                res = self.args.run(self)
+                self.check_system()
+            except Exception:
+                pass
 
-                if self.api_client.access_token != self.config.get("token", {}).get(
-                    "access_token"
-                ):
-                    logger.info("Токен был обновлен.")
-                    self.config.save(token=self.api_client.get_access_token())
-
-                return res
-            except KeyboardInterrupt:
-                logger.warning("Выполнение прервано пользователем!")
-                return 1
-            except sqlite3.Error as ex:
-                logger.exception(ex)
-                logger.warning(
-                    f"Возможно база данных повреждена, попробуйте удалить файл:\n"
-                    f"rm {self.db_path}"
-                )
-                return 1
-            except Exception as e:
-                logger.exception(e, exc_info=True)
-                return 1
-        parser.print_help(file=sys.stderr)
-        return 2
+    def _parse_args(self, argv) -> None:
+        self._parser = self._create_parser()
+        self.args = self._parser.parse_args(argv, namespace=BaseNamespace())
 
 
 def main(argv: Sequence[str] | None = None) -> None | int:
-    return HHApplicantTool().run(argv)
+    return HHApplicantTool(argv).run()

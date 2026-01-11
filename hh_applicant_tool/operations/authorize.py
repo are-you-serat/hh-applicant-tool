@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 import time
@@ -33,7 +33,7 @@ async def ainput(prompt: str) -> str:
 class Operation(BaseOperation):
     """Авторизация через Playwright"""
 
-    __aliases__: list = ["auth"]
+    __aliases__: list = ["auth", "authen", "authenticate"]
 
     # Селекторы
     SEL_LOGIN_INPUT = 'input[data-qa="login-input-username"]'
@@ -49,7 +49,11 @@ class Operation(BaseOperation):
     @property
     def is_headless(self) -> bool:
         """Свойство, определяющее режим работы браузера"""
-        return not self._args.no_headless
+        return not self._args.no_headless and self.is_automated
+
+    @property
+    def is_automated(self) -> bool:
+        return not self._args.manual
 
     @property
     def selector_timeout(self) -> int | None:
@@ -72,24 +76,37 @@ class Operation(BaseOperation):
             action="store_true",
             help="Показать окно браузера для отладки (отключает headless режим).",
         )
+        parser.add_argument(
+            "--manual",
+            action="store_true",
+            help="Ручной режим ввода кредов, редирект будет перехвачен.",
+        )
 
-    def run(self, applicant_tool: HHApplicantTool) -> None:
-        self._args = applicant_tool.args
+    def run(self, tool: HHApplicantTool) -> None:
+        self._args = tool.args
         try:
-            asyncio.run(self._main(applicant_tool))
+            asyncio.run(self._main(tool))
         except (KeyboardInterrupt, asyncio.TimeoutError):
             logger.warning("Что-то пошло не так")
-            os._exit(1)
+            # os._exit(1)
+            return 1
 
-    async def _main(self, applicant_tool: HHApplicantTool) -> None:
-        args = applicant_tool.args
-        api_client = applicant_tool.api_client
-        username = (
-            args.username or (await ainput("👤 Введите email или телефон: "))
-        ).strip()
+    async def _main(self, tool: HHApplicantTool) -> None:
+        args = tool.args
+        api_client = tool.api_client
+        storage = tool.storage
 
-        if not username:
-            raise RuntimeError("Empty username")
+        if self.is_automated:
+            username = (
+                args.username
+                or storage.settings.get_value("auth.username")
+                or (await ainput("👤 Введите email или телефон: "))
+            ).strip()
+
+            if not username:
+                raise RuntimeError("Empty username")
+
+            logger.debug(f"authenticate with: {username}")
 
         proxies = api_client.proxies
         proxy_url = proxies.get("https")
@@ -161,27 +178,31 @@ class Operation(BaseOperation):
                     wait_until="load",
                 )
 
-                # Шаг 1: Логин
-                logger.debug(f"Ожидание поля логина {self.SEL_LOGIN_INPUT}")
-                await page.wait_for_selector(
-                    self.SEL_LOGIN_INPUT, timeout=self.selector_timeout
-                )
-                await page.fill(self.SEL_LOGIN_INPUT, username)
-                logger.debug("Логин введен")
+                if self.is_automated:
+                    # Шаг 1: Логин
+                    logger.debug(f"Ожидание поля логина {self.SEL_LOGIN_INPUT}")
+                    await page.wait_for_selector(
+                        self.SEL_LOGIN_INPUT, timeout=self.selector_timeout
+                    )
+                    await page.fill(self.SEL_LOGIN_INPUT, username)
+                    logger.debug("Логин введен")
 
-                # Шаг 2: Выбор метода входа
-                if args.password:
-                    await self._direct_login(page, args.password)
-                else:
-                    await self._onetime_code_login(page)
+                    # Шаг 2: Выбор метода входа
+                    if args.password:
+                        await self._direct_login(page, args.password)
+                    else:
+                        await self._onetime_code_login(page)
 
                 # Шаг 3: Ожидание OAuth кода
-                logger.debug("Ожидание появления OAuth кода в трафике (таймаут 30с)...")
-                auth_code = await asyncio.wait_for(code_future, timeout=30.0)
+                logger.debug("Ожидание появления OAuth кода в трафике...")
+
+                auth_code = await asyncio.wait_for(
+                    code_future, timeout=[None, 30.0][self.is_automated]
+                )
 
                 page.remove_listener("request", handle_request)
 
-                logger.debug("Код получен, обмен на токен...")
+                logger.debug("Код получен, пробуем получить токен...")
                 token = await asyncio.to_thread(
                     api_client.oauth_client.authenticate,
                     auth_code,
@@ -199,6 +220,26 @@ class Operation(BaseOperation):
                 print("🔓 Авторизация прошла успешно!", file=sys.stderr)
 
                 print(json.dumps(auth_data, ensure_ascii=False))
+
+                # Сохраняем логин и пароль
+                if self.is_automated:
+                    storage.settings.set_value("auth.username", username)
+                    if args.password:
+                        storage.settings.set_value(
+                            "auth.password", args.password
+                        )
+
+                storage.settings.set_value("auth.last_login", datetime.now())
+
+                # storage.settings.set_value(
+                #     "auth.access_token", token["access_token"]
+                # )
+                # storage.settings.set_value(
+                #     "auth.refresh_token", token["refresh_token"]
+                # )
+                # storage.settings.set_value(
+                #     "auth.refresh_token", token["expires_in"]
+                # )
 
             finally:
                 logger.debug("Закрытие браузера")
@@ -223,7 +264,9 @@ class Operation(BaseOperation):
         logger.info("Вход по одноразовому коду...")
         await page.press(self.SEL_LOGIN_INPUT, "Enter")
 
-        logger.debug(f"Ожидание контейнера ввода кода: {self.SEL_CODE_CONTAINER}")
+        logger.debug(
+            f"Ожидание контейнера ввода кода: {self.SEL_CODE_CONTAINER}"
+        )
         await page.wait_for_selector(
             self.SEL_CODE_CONTAINER, timeout=self.selector_timeout
         )

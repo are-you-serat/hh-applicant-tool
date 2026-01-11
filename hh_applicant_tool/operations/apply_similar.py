@@ -6,19 +6,13 @@ import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, TextIO
 
+from .. import datatypes
 from ..ai.base import AIError
-from ..ai.openai import OpenAIChat
 from ..api import BadResponse, Redirect
 from ..api.errors import ApiError, LimitExceeded
-from ..main import BaseOperation
-from ..main import Namespace as BaseNamespace
-from ..types import Paginated, Vacancy
-from ..utils import (
-    bool2str,
-    list2str,
-    rand_text,
-    shorten,
-)
+from ..datatypes import PaginatedItems, SearchVacancy
+from ..main import BaseNamespace, BaseOperation
+from ..utils import bool2str, list2str, rand_text, shorten
 
 if TYPE_CHECKING:
     from ..main import HHApplicantTool
@@ -33,7 +27,8 @@ class Namespace(BaseNamespace):
     ignore_employers: Path | None
     force_message: bool
     use_ai: bool
-    pre_prompt: str
+    first_prompt: str
+    prompt: str
     order_by: str
     search: str
     schedule: str
@@ -99,9 +94,13 @@ class Operation(BaseOperation):
             action=argparse.BooleanOptionalAction,
         )
         parser.add_argument(
-            "--pre-prompt",
+            "--first-prompt",
+            help="Начальный помпт чата для генерации сопроводительного письма",
+            default="Напиши сопроводительное письмо для отклика на эту вакансию. Не используй placeholder'ы, твой ответ будет отправлен без обработки.",  # noqa: E501
+        )
+        parser.add_argument(
             "--prompt",
-            help="Добавочный промпт для генерации сопроводительного письма",
+            help="Промпт для генерации сопроводительного письма",
             default="Сгенерируй сопроводительное письмо не более 5-7 предложений от моего имени для вакансии",  # noqa: E501
         )
         parser.add_argument(
@@ -156,7 +155,9 @@ class Operation(BaseOperation):
         search_params_group.add_argument(
             "--employment", nargs="+", help="Тип занятости"
         )
-        search_params_group.add_argument("--area", nargs="+", help="Регион (area id)")
+        search_params_group.add_argument(
+            "--area", nargs="+", help="Регион (area id)"
+        )
         search_params_group.add_argument(
             "--metro", nargs="+", help="Станции метро (metro id)"
         )
@@ -179,7 +180,9 @@ class Operation(BaseOperation):
             "--salary", type=int, help="Минимальная зарплата"
         )
         search_params_group.add_argument(
-            "--only-with-salary", default=False, action=argparse.BooleanOptionalAction
+            "--only-with-salary",
+            default=False,
+            action=argparse.BooleanOptionalAction,
         )
         search_params_group.add_argument(
             "--label", nargs="+", help="Метки вакансий (label)"
@@ -227,17 +230,21 @@ class Operation(BaseOperation):
             help="Только премиум вакансии",
         )
         search_params_group.add_argument(
-            "--search-field", nargs="+", help="Поля поиска (name, company_name и т.п.)"
+            "--search-field",
+            nargs="+",
+            help="Поля поиска (name, company_name и т.п.)",
         )
 
     def run(
         self,
-        applicant_tool: HHApplicantTool,
+        tool: HHApplicantTool,
     ) -> None:
-        self.applicant_tool = applicant_tool
-        self.api_client = applicant_tool.api_client
-        args: Namespace = applicant_tool.args
-        self.application_messages = self._get_application_messages(args.message_list)
+        self.tool = tool
+        self.api_client = tool.api_client
+        args: Namespace = tool.args
+        self.application_messages = self._get_application_messages(
+            args.message_list
+        )
         self.area = args.area
         self.bottom_lat = args.bottom_lat
         self.currency = args.currency
@@ -258,10 +265,10 @@ class Operation(BaseOperation):
         self.order_by = args.order_by
         self.per_page = args.per_page
         self.period = args.period
-        self.pre_prompt = args.pre_prompt
+        self.pre_prompt = args.prompt
         self.premium = args.premium
         self.professional_role = args.professional_role
-        self.resume_id = args.resume_id or applicant_tool.first_resume_id()
+        self.resume_id = args.resume_id or tool.first_resume_id()
         self.right_lng = args.right_lng
         self.salary = args.salary
         self.schedule = args.schedule
@@ -271,28 +278,14 @@ class Operation(BaseOperation):
         self.sort_point_lng = args.sort_point_lng
         self.top_lat = args.top_lat
         self.total_pages = args.total_pages
-
-        self.ai_chat = None
-        self._set_ai_chat()
+        self.openai_chat = (
+            tool.get_openai_chat(args.first_prompt) if args.use_ai else None
+        )
         self._apply_similar()
 
-    def _set_ai_chat(self) -> None:
-        c = self.applicant_tool.config.get("openai", {})
-        if not (token := c.get("token")):
-            return
-        model = c.get("model", "gpt-5.1")
-        system_prompt = c.get(
-            "system_prompt",
-            "Напиши сопроводительное письмо для отклика на эту вакансию. Не используй placeholder'ы, твой ответ будет отправлен без обработки.",  # noqa: E501
-        )
-        self.ai_chat = OpenAIChat(
-            token=token,
-            model=model,
-            system_prompt=system_prompt,
-            session=self.applicant_tool.session,
-        )
-
-    def _get_application_messages(self, message_list: TextIO | None) -> list[str]:
+    def _get_application_messages(
+        self, message_list: TextIO | None
+    ) -> list[str]:
         return (
             list(filter(None, map(str.strip, message_list)))
             if message_list
@@ -303,7 +296,7 @@ class Operation(BaseOperation):
         )
 
     def _apply_similar(self) -> None:
-        me = self.applicant_tool.get_me()
+        me: datatypes.User = self.tool.get_me()
 
         basic_placeholders = {
             "first_name": me.get("first_name", ""),
@@ -312,6 +305,7 @@ class Operation(BaseOperation):
             "phone": me.get("phone", ""),
         }
 
+        seen_employers = set()
         for vacancy in self._get_vacancies():
             try:
                 employer = vacancy.get("employer", {})
@@ -322,21 +316,19 @@ class Operation(BaseOperation):
                     **basic_placeholders,
                 }
 
-                logger.debug(
-                    "Вакансия от %(employer_name)s: %(vacancy_name)s" % placeholders
-                )
-                self.applicant_tool.storage.vacancies.save(vacancy)
+                storage = self.tool.storage
+                storage.vacancies.save(vacancy)
+                if employer := vacancy.get("employer"):
+                    employer_id = employer.get("id")
+                    if employer_id and employer_id not in seen_employers:
+                        employer_profile: datatypes.Employer = (
+                            self.api_client.get(f"/employers/{employer_id}")
+                        )
+                        storage.employers.save(employer_profile)
 
                 # По факту контакты можно получить только здесь?!
-                if contacts := vacancy.get("contacts"):
-                    # Профиль компании могут снести и тогда о ней ничего не узнать
-                    if employer_id := employer.get("id"):
-                        employer_profile = self.api_client.get(
-                            f"/employers/{employer_id}"
-                        )
-                        # Сначала нужно работодателя сохранить, так как контакты на него ссылаются
-                        self.applicant_tool.storage.employers.save(employer_profile)
-                        self.applicant_tool.storage.contacts.save(employer_id, contacts)
+                if vacancy.get("contacts"):
+                    storage.employer_contacts.save(vacancy)
 
                 if vacancy.get("has_test"):
                     logger.debug(
@@ -370,7 +362,9 @@ class Operation(BaseOperation):
                         vacancy["alternate_url"],
                     )
                     if "got_rejection" in relations:
-                        logger.debug("Вы получили отказ: %s", vacancy["alternate_url"])
+                        logger.debug(
+                            "Вы получили отказ: %s", vacancy["alternate_url"]
+                        )
                         print("⛔  Пришел отказ", vacancy["alternate_url"])
                     continue
 
@@ -380,12 +374,14 @@ class Operation(BaseOperation):
                     "message": "",
                 }
 
-                if self.force_message or vacancy.get("response_letter_required"):
-                    if self.ai_chat:
+                if self.force_message or vacancy.get(
+                    "response_letter_required"
+                ):
+                    if self.openai_chat:
                         msg = self.pre_prompt + "\n\n"
                         msg += placeholders["vacancy_name"]
                         logger.debug("prompt: %s", msg)
-                        msg = self.ai_chat.send_message(msg)
+                        msg = self.openai_chat.send_message(msg)
                     else:
                         msg = (
                             rand_text(random.choice(self.application_messages))
@@ -403,7 +399,9 @@ class Operation(BaseOperation):
                             delay=random.uniform(1, 3),
                         )
                         assert res == {}
-                        logger.debug("Отправили отклик: %s", vacancy["alternate_url"])
+                        logger.debug(
+                            "Отправили отклик: %s", vacancy["alternate_url"]
+                        )
                     print(
                         "📨 Отправили отклик:",
                         vacancy["alternate_url"],
@@ -416,6 +414,7 @@ class Operation(BaseOperation):
             except LimitExceeded:
                 logger.info("Достигли лимита на отклики")
                 print("⚠️ Достигли лимита рассылки")
+                self.tool.storage.settings.set_value("_")
                 break
             except ApiError as ex:
                 logger.warning(ex)
@@ -490,10 +489,10 @@ class Operation(BaseOperation):
 
         return params
 
-    def _get_vacancies(self) -> Iterator[Vacancy]:
+    def _get_vacancies(self) -> Iterator[SearchVacancy]:
         for page in range(self.total_pages):
             params = self._get_search_params(page)
-            res: Paginated[Vacancy] = self.api_client.get(
+            res: PaginatedItems[SearchVacancy] = self.api_client.get(
                 f"/resumes/{self.resume_id}/similar_vacancies",
                 params,
             )
